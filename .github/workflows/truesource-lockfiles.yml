@@ -1,0 +1,385 @@
+# Example GitHub Actions workflow that regenerates the lock files of an upgrade pull request opened by
+# TrueSource Viewer. The viewer edits manifests only (package.json, requirements*.txt, pom.xml); this
+# workflow runs the package manager against TrueSource and commits the lock files back to the pull
+# request's branch, so nobody has to clone the repository to do it.
+#
+# Add it once as .github/workflows/truesource-lockfiles.yml. It runs on pull requests from the
+# viewer's branches (truesource/fix-*) of this repository, never on a fork, and can be started by hand
+# on such a branch (Run workflow). Each package manager runs only when its manifests changed:
+#   - npm: npm install --package-lock-only --ignore-scripts, pnpm install --lockfile-only
+#     --ignore-scripts --ignore-pnpmfile, or yarn install --mode=update-lockfile --no-immutable
+#     (Yarn 2 or later), whichever lock file the project already has. Yarn 1 has no lock-file-only
+#     mode and is left to do by hand.
+#   - uv: uv lock --upgrade-package <name>==<version> for each requirements pin the pull request
+#     moved, without building any source-only package (UV_NO_BUILD). The job fails when uv.lock does
+#     not reach a moved version (pyproject.toml does not allow it), and nothing is committed.
+#   - Poetry and pip-compile are not run here (they would need packages built or tools installed
+#     without pinned dependencies): the pull request lists their commands for a person to run.
+#   - Maven has no lock file: nothing to regenerate.
+#
+# The jobs that run a package manager only read the repository and hold the TrueSource settings; they
+# hand the lock files on as an artifact. The commit job holds the write token and no TrueSource
+# setting, runs no package manager, and commits only lock files the repository already tracks.
+#
+# Settings (names only; the values are yours):
+#   - repository variable TRUESOURCE_NPM_REGISTRY: the TrueSource npm registry address
+#   - repository secret TRUESOURCE_NPM_TOKEN: the TrueSource token for npm
+#   - repository secret TRUESOURCE_PYPI_INDEX: the TrueSource PyPI index with username and token,
+#     https://USER:TOKEN@host/api/pypi/<repository>/simple (write @ in a username as %40)
+# A project .npmrc or .yarnrc.yml that names another registry is honoured by npm, pnpm and Yarn.
+# uv lock moves every package of uv.lock to the TrueSource index, not only the ones that changed.
+#
+# A commit pushed with GITHUB_TOKEN starts no other workflow: re-run the other checks of the pull
+# request, or push again, after the lock files are committed.
+name: TrueSource lock files
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: truesource-lockfiles-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  changes:
+    if: >-
+      (github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.head_ref, 'truesource/fix-'))
+      || (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'truesource/fix-'))
+    runs-on: ubuntu-latest
+    outputs:
+      npm: ${{ steps.find.outputs.npm }}
+      pypi: ${{ steps.find.outputs.pypi }}
+      base: ${{ steps.find.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find the manifests that changed
+        id: find
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || format('origin/{0}', github.event.repository.default_branch) }}
+        run: |
+          base=$(git merge-base "$BASE" HEAD)
+          changed=$(git diff --name-only "$base" HEAD)
+          dirs() { grep -E "$1" | grep -v 'node_modules/' | xargs -r -d '\n' -n1 dirname | sort -u || true; }
+          npm=$(printf '%s\n' "$changed" | dirs '(^|/)package\.json$')
+          pypi=$(printf '%s\n' "$changed" | dirs '(^|/)(requirements[^/]*\.txt|pyproject\.toml)$')
+          if printf '%s\n' "$changed" | grep -qE '(^|/)pom\.xml$'; then
+            echo "::notice::Maven has no lock file: nothing to regenerate for pom.xml."
+          fi
+          delimiter="EOF_$RANDOM$RANDOM"
+          {
+            echo "base=$base"
+            echo "npm<<$delimiter"; echo "$npm"; echo "$delimiter"
+            echo "pypi<<$delimiter"; echo "$pypi"; echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+  npm:
+    needs: changes
+    if: needs.changes.outputs.npm != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.collect.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Write the registry settings outside the repository
+        env:
+          TRUESOURCE_NPM_REGISTRY: ${{ vars.TRUESOURCE_NPM_REGISTRY || secrets.TRUESOURCE_NPM_REGISTRY }}
+          TRUESOURCE_NPM_TOKEN: ${{ secrets.TRUESOURCE_NPM_TOKEN }}
+        run: |
+          if [ -z "$TRUESOURCE_NPM_REGISTRY" ] || [ -z "$TRUESOURCE_NPM_TOKEN" ]; then
+            echo "::error::Set the repository variable TRUESOURCE_NPM_REGISTRY and the secret TRUESOURCE_NPM_TOKEN."
+            exit 1
+          fi
+          registry="${TRUESOURCE_NPM_REGISTRY%/}/"
+          umask 077
+          # the token is written to these files only, so the package managers never see it in their
+          # environment and a project file cannot hand it to another host by naming ${...}
+          printf 'registry=%s\n//%s:_authToken=%s\n' "$registry" "${registry#*://}" "$TRUESOURCE_NPM_TOKEN" \
+            > "$RUNNER_TEMP/truesource.npmrc"
+          printf 'npmRegistryServer: "%s"\nnpmRegistries:\n  "//%s":\n    npmAuthToken: "%s"\n' \
+            "$registry" "${registry#*://}" "$TRUESOURCE_NPM_TOKEN" > "$HOME/.yarnrc.yml"
+      - name: Regenerate the npm lock files
+        env:
+          DIRS: ${{ needs.changes.outputs.npm }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/truesource.npmrc
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          # the nearest folder with a lock file, up to the repository root (workspaces lock at the top)
+          lockdir() {
+            d="$1"
+            while :; do
+              for f in package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock; do
+                if [ -f "$d/$f" ]; then echo "$d"; return; fi
+              done
+              if [ "$d" = . ]; then return; fi
+              d=$(dirname "$d")
+            done
+          }
+          # Yarn 2 or later: a .yarnrc.yml, a packageManager of yarn@2 and up, or a lock file with __metadata
+          berry() {
+            [ -f "$1/.yarnrc.yml" ] || [ -f .yarnrc.yml ] \
+              || grep -qE '"packageManager"[[:space:]]*:[[:space:]]*"yarn@([2-9]|[1-9][0-9])' "$1/package.json" package.json 2>/dev/null \
+              || grep -q '^__metadata:' "$1/yarn.lock"
+          }
+          done_dirs=""
+          while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            lock=$(lockdir "$dir")
+            if [ -z "$lock" ]; then
+              echo "::notice::No lock file for $dir/package.json: nothing to regenerate."
+              continue
+            fi
+            case " $done_dirs " in *" $lock "*) continue ;; esac
+            done_dirs="$done_dirs $lock"
+            if [ -f "$lock/package-lock.json" ] || [ -f "$lock/npm-shrinkwrap.json" ]; then
+              (cd "$lock" && npm install --package-lock-only --ignore-scripts)
+            elif [ -f "$lock/pnpm-lock.yaml" ]; then
+              (cd "$lock" && pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile)
+            elif berry "$lock"; then
+              (cd "$lock" && yarn install --mode=update-lockfile --no-immutable)
+            else
+              echo "::notice::$lock/yarn.lock is a Yarn 1 lock file, which has no lock-file-only mode: regenerate it by hand."
+            fi
+          done <<< "$DIRS"
+      - name: Collect the lock files that changed
+        id: collect
+        env:
+          TRUESOURCE_NPM_TOKEN: ${{ secrets.TRUESOURCE_NPM_TOKEN }}
+        run: |
+          rm -f "$RUNNER_TEMP/truesource.npmrc" "$HOME/.yarnrc.yml"
+          out="$RUNNER_TEMP/lockfiles"
+          mkdir -p "$out"
+          git diff --name-only -z -- \
+            '*package-lock.json' '*npm-shrinkwrap.json' '*pnpm-lock.yaml' '*yarn.lock' > "$RUNNER_TEMP/changed"
+          if [ ! -s "$RUNNER_TEMP/changed" ]; then
+            echo "The lock files did not change."
+            exit 0
+          fi
+          if xargs -0 grep -lF -- "$TRUESOURCE_NPM_TOKEN" < "$RUNNER_TEMP/changed"; then
+            echo "::error::A lock file holds the registry token: nothing is handed on."
+            exit 1
+          fi
+          while IFS= read -r -d '' f; do
+            if [ -L "$f" ] || [ ! -f "$f" ]; then
+              echo "::error::$f is not a regular file: nothing is handed on."
+              exit 1
+            fi
+            mkdir -p "$out/$(dirname "$f")"
+            cp -- "$f" "$out/$f"
+          done < "$RUNNER_TEMP/changed"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.collect.outputs.changed == 'true'
+        with:
+          name: truesource-lockfiles-npm
+          path: ${{ runner.temp }}/lockfiles/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+  uv:
+    needs: changes
+    if: needs.changes.outputs.pypi != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.collect.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find the uv lock files and the pins the pull request moved
+        id: plan
+        env:
+          DIRS: ${{ needs.changes.outputs.pypi }}
+          BASE: ${{ needs.changes.outputs.base }}
+        run: |
+          : > "$RUNNER_TEMP/uv-dirs"
+          while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            d="$dir"
+            while :; do
+              if [ -f "$d/uv.lock" ]; then echo "$d" >> "$RUNNER_TEMP/uv-dirs"; break; fi
+              if [ "$d" = . ]; then break; fi
+              d=$(dirname "$d")
+            done
+          done <<< "$DIRS"
+          sort -u -o "$RUNNER_TEMP/uv-dirs" "$RUNNER_TEMP/uv-dirs"
+          # the == pins the pull request added to a requirements*.txt
+          git diff -U0 "$BASE" HEAD -- '*requirements*.txt' \
+            | sed -nE 's/^\+[[:space:]]*([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^]]*\])?[[:space:]]*==[[:space:]]*([A-Za-z0-9.+!_-]+).*/\1==\3/p' \
+            | sort -u > "$RUNNER_TEMP/pins"
+          if [ ! -s "$RUNNER_TEMP/uv-dirs" ]; then
+            echo "::notice::No uv.lock for the changed files: nothing to regenerate. Poetry and pip-compile are left to a person."
+          elif [ ! -s "$RUNNER_TEMP/pins" ]; then
+            echo "::notice::The pull request moves no == pin: nothing to regenerate."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        if: steps.plan.outputs.run == 'true'
+        with:
+          version: "0.13.4"
+          checksum: "2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f"
+          enable-cache: false
+      - name: Regenerate the uv lock files
+        if: steps.plan.outputs.run == 'true'
+        env:
+          UV_DEFAULT_INDEX: ${{ secrets.TRUESOURCE_PYPI_INDEX }}
+          # never build a source-only package: building runs its own code
+          UV_NO_BUILD: "1"
+        run: |
+          if [ -z "$UV_DEFAULT_INDEX" ]; then
+            echo "::error::Set the repository secret TRUESOURCE_PYPI_INDEX."
+            exit 1
+          fi
+          upgrades=()
+          while IFS= read -r pin; do upgrades+=(--upgrade-package "$pin"); done < "$RUNNER_TEMP/pins"
+          while IFS= read -r dir; do
+            (cd "$dir" && uv lock "${upgrades[@]}")
+            # every moved pin of a package uv.lock has must be in it at that version
+            python3 -I - "$dir/uv.lock" "$RUNNER_TEMP/pins" <<'PY'
+          import re, sys, tomllib
+          def norm(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+          with open(sys.argv[1], "rb") as f:
+              packages = tomllib.load(f).get("package", [])
+          locked = {}
+          for p in packages:
+              locked.setdefault(norm(p["name"]), set()).add(p.get("version", ""))
+          missing = []
+          for line in open(sys.argv[2]):
+              name, _, version = line.strip().partition("==")
+              versions = locked.get(norm(name))
+              if versions is not None and version not in versions:
+                  missing.append(f"{name}=={version}")
+          if missing:
+              print(f"::error::{sys.argv[1]} does not reach " + ", ".join(missing)
+                    + ": move the version in pyproject.toml. Nothing is committed.")
+              sys.exit(1)
+          PY
+          done < "$RUNNER_TEMP/uv-dirs"
+      - name: Collect the lock files that changed
+        id: collect
+        if: steps.plan.outputs.run == 'true'
+        env:
+          TRUESOURCE_PYPI_INDEX: ${{ secrets.TRUESOURCE_PYPI_INDEX }}
+        run: |
+          out="$RUNNER_TEMP/lockfiles"
+          mkdir -p "$out"
+          git diff --name-only -z -- '*uv.lock' > "$RUNNER_TEMP/changed"
+          if [ ! -s "$RUNNER_TEMP/changed" ]; then
+            echo "The lock files did not change."
+            exit 0
+          fi
+          authority="${TRUESOURCE_PYPI_INDEX#*://}"
+          authority="${authority%%/*}"
+          case "$authority" in
+            *@*)
+              if xargs -0 grep -lF -- "${authority%@*}" < "$RUNNER_TEMP/changed"; then
+                echo "::error::A lock file holds the index credentials: nothing is handed on."
+                exit 1
+              fi
+              ;;
+          esac
+          while IFS= read -r -d '' f; do
+            if [ -L "$f" ] || [ ! -f "$f" ]; then
+              echo "::error::$f is not a regular file: nothing is handed on."
+              exit 1
+            fi
+            mkdir -p "$out/$(dirname "$f")"
+            cp -- "$f" "$out/$f"
+          done < "$RUNNER_TEMP/changed"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.collect.outputs.changed == 'true'
+        with:
+          name: truesource-lockfiles-uv
+          path: ${{ runner.temp }}/lockfiles/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+  commit:
+    # runs no package manager and holds no TrueSource setting: only the lock files are committed
+    needs: [changes, npm, uv]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.npm.outputs.changed == 'true' || needs.uv.outputs.changed == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: truesource-lockfiles-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/lockfiles
+      - name: Take only the lock files the repository tracks
+        run: |
+          in="$RUNNER_TEMP/lockfiles"
+          if find "$in" ! -type f ! -type d | grep -q .; then
+            echo "::error::The artifact holds something other than files: nothing is committed."
+            exit 1
+          fi
+          count=0
+          while IFS= read -r -d '' f; do
+            path="${f#"$in"/}"
+            case "/$path/" in
+              */../*|*/./*|//*) echo "::error::Unexpected path $path: nothing is committed."; exit 1 ;;
+            esac
+            case "$(basename "$path")" in
+              package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock) ;;
+              *) echo "::error::$path is not a lock file: nothing is committed."; exit 1 ;;
+            esac
+            # already tracked, as a regular file (not a link), and not under node_modules
+            mode=$(git ls-files -s -- "$path" | cut -d' ' -f1)
+            if [ "$mode" != 100644 ] && [ "$mode" != 100755 ]; then
+              echo "::error::$path is not a lock file the repository tracks: nothing is committed."
+              exit 1
+            fi
+            case "$path" in */node_modules/*|node_modules/*) echo "::error::$path is under node_modules."; exit 1 ;; esac
+            if [ -L "$path" ]; then echo "::error::$path is a link: nothing is committed."; exit 1; fi
+            cp -- "$f" "$path"
+            git add -- "$path"
+            count=$((count + 1))
+          done < <(find "$in" -type f -print0)
+          # nothing else changed
+          if git status --porcelain --untracked-files=all | grep -qv '^M  '; then
+            echo "::error::Other files changed: nothing is committed."
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
+          echo "$count lock files taken."
+      - name: Commit the lock files that changed
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --cached --quiet; then
+            echo "The lock files did not change."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Regenerate lock files against TrueSource"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            push "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$BRANCH"
