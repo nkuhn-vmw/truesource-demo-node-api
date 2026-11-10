@@ -1,0 +1,85 @@
+# Example GitHub Actions workflow that runs an npm build through the JFrog CLI, publishes its build-info
+# to the company's Artifactory, and asks the viewer to judge what the build actually downloaded:
+#   1. npm resolves through the TrueSource npm remote of the company's Artifactory (jf npm-config);
+#   2. jf npm ci installs and records every dependency with its checksums;
+#   3. jf rt build-collect-env (bce) and build-add-git (bag) add the environment and the commit;
+#   4. jf rt build-publish (bp) publishes the build-info as <repository name>/<run number>;
+#   5. POST /api/gate?repository=...&build=name/number judges that build: its libraries by the gate's
+#      rules, and every dependency downloaded from outside TrueSource (rule resolved-outside-truesource).
+# The viewer needs buildinfo.url and buildinfo.token (a read-only token of the same Artifactory); the
+# build name is the repository's name, which the viewer's Build card on the application page expects
+# too (set buildinfo.builds.[owner/repo] on the viewer for another name). Other ecosystems work the same
+# way: jf mvn-config / jf mvn, jf pip-config / jf pip install, jf docker build.
+#
+# Settings (names only; the values are yours):
+#   - repository variable JFROG_URL: the company's JFrog Platform, such as https://acme.jfrog.io
+#   - repository variable TRUESOURCE_NPM_REPO: the TrueSource npm remote there (default truesource-npm)
+#   - repository variable TRUESOURCE_VIEWER_URL: the viewer's address
+#   - repository secret JFROG_ACCESS_TOKEN: a token that may resolve from the remote and publish builds
+#   - repository secret TRUESOURCE_GATE_TOKEN: the viewer's access.gate-token (only when it asks for one)
+#
+# Pushes to main record the verdict as the application's; pull requests and manual runs only ask (GET). Third-party actions are
+# pinned to a commit SHA; review a newer one before moving the pin.
+name: TrueSource build-info
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: truesource-build-info-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    # pull requests from forks get no secrets: skip them
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      JFROG_CLI_BUILD_NAME: ${{ github.event.repository.name }}
+      JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: jfrog/setup-jfrog-cli@1e584506871998c267b7c100c02628a5b9c81db6 # v5.3.0
+        env:
+          JF_URL: ${{ vars.JFROG_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JFROG_ACCESS_TOKEN }}
+        with:
+          custom-server-id: company
+          # published below, before the viewer is asked
+          disable-auto-build-publish: true
+      - name: Resolve npm through the TrueSource remote
+        env:
+          NPM_REPO: ${{ vars.TRUESOURCE_NPM_REPO || 'truesource-npm' }}
+        run: jf npm-config --global=false --server-id-resolve=company --repo-resolve="$NPM_REPO"
+      - name: Install, recording the build-info
+        run: jf npm ci
+      - name: Add the environment and the commit
+        run: |
+          jf rt build-collect-env
+          jf rt build-add-git
+      - name: Publish the build-info
+        run: jf rt build-publish
+      - name: Ask TrueSource Viewer
+        env:
+          VIEWER: ${{ vars.TRUESOURCE_VIEWER_URL }}
+          GATE_TOKEN: ${{ secrets.TRUESOURCE_GATE_TOKEN }}
+          # only a push to main records the verdict as the application's; anything else only asks
+          METHOD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'POST' || 'GET' }}
+        run: |
+          # the build's number, not the latest: the viewer caches its answers for a few minutes
+          verdict=$(curl -fsS -X "$METHOD" -o gate.md -w '%header{x-gate-verdict}' -H "X-Gate-Token: $GATE_TOKEN" \
+            --url-query "repository=$GITHUB_REPOSITORY" \
+            --url-query "build=$JFROG_CLI_BUILD_NAME/$JFROG_CLI_BUILD_NUMBER" \
+            "$VIEWER/api/gate?format=markdown")
+          cat gate.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$verdict" != pass ]; then
+            echo "::error::The TrueSource gate did not pass for build $JFROG_CLI_BUILD_NUMBER ($verdict). The job summary lists what to change."
+            exit 1
+          fi
