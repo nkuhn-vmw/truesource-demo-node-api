@@ -1,0 +1,110 @@
+# Example GitHub Actions workflow for pull requests. It asks the viewer about the pull request's own
+# libraries and then
+#   - shows each finding in GitHub code scanning (SARIF),
+#   - adds one comment to the pull request, and updates that comment on every later push,
+#   - fails the job when the gate fails.
+# Set the repository variable TRUESOURCE_VIEWER_URL to the viewer's address and the repository secret
+# TRUESOURCE_GATE_TOKEN to the viewer's access.gate-token (only needed when the viewer asks for a sign-in).
+#
+# The first call names the pull request (pr=), so that the viewer can send the event "A pull request
+# fails the gate" (gate.pull-request-failing) to the destinations that subscribe to it, once per turn
+# to failing; it needs the gate token, or a viewer that asks for no sign-in.
+#
+# The job builds an SBOM of the checked-out head and posts it with the head's Dockerfiles and
+# Containerfiles (at most 10, each under 256 KB, symbolic links never followed), so that their base
+# images are judged too; no credential leaves GitHub. Dockerfiles under test fixtures or vendored
+# trees are sent too: to leave a directory out, add  -path ./that/dir -prune -o  to the find command.
+# The viewer writes nothing to GitHub: the upload and the comment use this workflow's own GITHUB_TOKEN.
+# Code scanning needs GitHub Advanced Security on a private repository.
+#
+# Pull requests from a fork: GitHub gives the job a read-only token and no secrets. The upload and the
+# comment are skipped there, and if the viewer asks for a sign-in the gate call itself fails for want of
+# the token. Dependabot pull requests read only Dependabot secrets: add TRUESOURCE_GATE_TOKEN there too.
+# To leave forks out, add  if: github.event.pull_request.head.repo.full_name == github.repository  to the
+# job. Do not switch to pull_request_target to get the secrets: it would run the fork's code with them.
+name: TrueSource gate
+on: [pull_request]
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  pull-requests: write
+concurrency:
+  group: truesource-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+      - name: Ask TrueSource Viewer
+        id: gate
+        env:
+          VIEWER: ${{ vars.TRUESOURCE_VIEWER_URL }}
+          GATE_TOKEN: ${{ secrets.TRUESOURCE_GATE_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # SARIF points at this workflow file, which is in the repository (the SBOM is not); a finding
+          # about a Dockerfile's image points at that Dockerfile
+          workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY"/}"
+          workflow="${workflow%%@*}"
+          # the Dockerfiles and Containerfiles, each named by its path: regular files only (find does not
+          # follow symbolic links), plain path characters, paths of at most 256 characters, under 256 KB,
+          # at most 10
+          parts=()
+          while IFS= read -r -d '' f; do
+            f="${f#./}"
+            case "$f" in *[!A-Za-z0-9._/-]*) continue ;; esac
+            [ "${#f}" -le 256 ] || continue
+            [ "$(wc -c < "$f")" -le 262144 ] || continue
+            parts+=(-F "containerfile=@$f;filename=$f;type=text/plain")
+            [ "${#parts[@]}" -lt 20 ] || break
+          done < <(find . -path ./.git -prune -o -path '*/node_modules' -prune -o -type f \
+            \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.Dockerfile' -o -name Containerfile \) \
+            ! -name '*.dockerignore' -print0 | sort -z)
+          # on a refusal the viewer's reason is printed, and the answer is not kept as a report
+          verdict=$(curl --fail-with-body -sS -o gate.sarif -w '%header{x-gate-verdict}' \
+            -H "X-Gate-Token: $GATE_TOKEN" -F "file=@sbom.cdx.json" "${parts[@]}" --url-query "path=$workflow" \
+            --url-query "repository=$GITHUB_REPOSITORY" --url-query "pr=$PR" "$VIEWER/api/gate?format=sarif") \
+            || { cat gate.sarif 2> /dev/null; echo; rm -f gate.sarif; exit 1; }
+          curl --fail-with-body -sS -o gate.md -H "X-Gate-Token: $GATE_TOKEN" -F "file=@sbom.cdx.json" "${parts[@]}" \
+            --url-query "repository=$GITHUB_REPOSITORY" "$VIEWER/api/gate?format=markdown" \
+            || { cat gate.md 2> /dev/null; echo; rm -f gate.md; exit 1; }
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+      - name: Show the findings in code scanning
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('gate.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: gate.sarif
+          category: truesource-gate
+      - name: Comment on the pull request
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('gate.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- truesource-viewer-gate -->"))) | .id' | sed -n 1p)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@gate.md > /dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@gate.md > /dev/null
+          fi
+      - name: Fail unless the gate passes
+        if: always() && steps.gate.outputs.verdict != 'pass'
+        env:
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+        run: |
+          if [ "$VERDICT" = fail ]; then
+            echo "::error::The TrueSource gate failed. The pull request comment lists what to change."
+          else
+            echo "::error::The viewer sent no X-Gate-Verdict, so the pull request cannot be judged."
+          fi
+          exit 1
