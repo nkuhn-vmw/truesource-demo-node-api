@@ -1,4 +1,4 @@
-FROM node:22.11.0-alpine
+FROM packages.broadcom.com/trusted-artifacts-secure-images/containers/photon-5/node:22.23.4
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
